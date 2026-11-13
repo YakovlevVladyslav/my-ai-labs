@@ -100,6 +100,171 @@ $$y^*=\frac{\int_0^{100}y\,\mu_{agg}(y)\,dy}{\int_0^{100}\mu_{agg}(y)\,dy}.$$
 | `tests/test_inference.py` | Автоматические проверки модели |
 | `requirements.txt` | Зависимости Python |
 
+### 4.1. Представление нечётких множеств и правил (`fuzzy_model.py`)
+
+На первом этапе задаются **универсумы** — сетки допустимых значений каждой переменной, а также функции принадлежности для лингвистических термов. `np.linspace(a, b, n)` создаёт `n` равномерно распределённых точек, которые затем используются при построении графиков и расчётах.
+
+Ниже приведены **полные определения** универсумов и функций принадлежности из проекта:
+
+```python
+UNIVERSES = {
+    "load": np.linspace(0, 100, 1001),
+    "latency": np.linspace(0, 300, 1201),
+    "errors": np.linspace(0, 10, 1001),
+    "state": np.linspace(0, 100, 1001),
+}
+
+MEMBERSHIPS = {
+    "load": {
+        "low": fuzz.trapmf(UNIVERSES["load"], [0, 0, 20, 45]),
+        "medium": fuzz.trimf(UNIVERSES["load"], [25, 50, 75]),
+        "high": fuzz.trapmf(UNIVERSES["load"], [55, 80, 100, 100]),
+    },
+    "latency": {
+        "low": fuzz.trapmf(UNIVERSES["latency"], [0, 0, 30, 100]),
+        "medium": fuzz.trimf(UNIVERSES["latency"], [60, 130, 200]),
+        "high": fuzz.trapmf(UNIVERSES["latency"], [160, 230, 300, 300]),
+    },
+    "errors": {
+        "low": fuzz.trapmf(UNIVERSES["errors"], [0, 0, 0.5, 2]),
+        "medium": fuzz.trimf(UNIVERSES["errors"], [1, 3, 5]),
+        "high": fuzz.trapmf(UNIVERSES["errors"], [4, 6, 10, 10]),
+    },
+    "state": {
+        "normal": fuzz.trapmf(UNIVERSES["state"], [0, 0, 15, 40]),
+        "overloaded": fuzz.trimf(UNIVERSES["state"], [30, 50, 70]),
+        "critical": fuzz.trapmf(UNIVERSES["state"], [60, 85, 100, 100]),
+    },
+}
+```
+
+`fuzz.trimf(...)` задаёт треугольную функцию принадлежности (три опорные точки), `fuzz.trapmf(...)` — трапециевидную (четыре точки). Так, `load.medium = trimf([25, 50, 75])` даёт принадлежность 1 при загрузке 50% и 0 при 25% и 75%. Перекрытие функций позволяет одному значению одновременно принадлежать нескольким термам.
+
+Логические условия правил представлены кортежами. Следующие **полные функции** создают листья дерева условий и составные выражения:
+
+```python
+def atom(variable: str, term: str) -> Expression:
+    return ("atom", variable, term)
+
+def AND(*children: Expression) -> Expression:
+    return ("and", *children)
+
+def OR(*children: Expression) -> Expression:
+    return ("or", *children)
+```
+
+Например, `AND(atom("load", "high"), atom("errors", "high"))` хранит структуру условия **«загрузка высокая И ошибки высокие»**. Операторы здесь пока не вычисляются — их обработка происходит в функции `evaluate_expression`.
+
+Каждое правило хранит идентификатор (`code`), описание (`description`), условие (`condition`) и выходной терм (`output`). **Все 17 правил** перечислены в таблице раздела 3.2 и непосредственно в исходном файле `fuzzy_model.py`.
+
+### 4.2. Проверка входных данных (`validate_inputs`)
+
+Перед фаззификацией необходимо проверить, что все три значения заданы, могут быть преобразованы в числа, конечны (`NaN` и бесконечность не допускаются) и попадают в допустимые диапазоны.
+
+Полная реализация функции:
+
+```python
+def validate_inputs(load: float, latency: float, errors: float) -> dict[str, float]:
+    bounds = {"load": (load, 0, 100), "latency": (latency, 0, 300), "errors": (errors, 0, 10)}
+    cleaned = {}
+    for name, (raw, minimum, maximum) in bounds.items():
+        if raw is None or isinstance(raw, bool):
+            raise ValueError(f"Параметр '{name}' должен быть числом.")
+        try:
+            value = float(raw)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Параметр '{name}' должен быть числом.") from exc
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(f"Параметр '{name}' должен находиться в диапазоне {minimum}–{maximum}.")
+        cleaned[name] = value
+    return cleaned
+```
+
+Функция принимает значения загрузки, RTT и доли ошибок и возвращает словарь `{"load": ..., "latency": ..., "errors": ...}` с числами `float`. Если вход некорректен, генерирует `ValueError` с описанием причины. Например, отрицательная задержка или ошибка 15% будут отклонены.
+
+### 4.3. Применение правил AND/OR (`evaluate_expression`)
+
+После фаззификации для каждой входной переменной уже вычислены степени принадлежности (например, `load.medium = 0.4`, `load.high = 0.4`). Для определения силы активации правила программа рекурсивно обходит дерево его условия.
+
+Полная реализация функции:
+
+```python
+def evaluate_expression(expression: Expression, memberships: dict[str, dict[str, float]]) -> float:
+    operator, *args = expression
+    if operator == "atom":
+        variable, term = args
+        return memberships[variable][term]
+    if operator == "and":
+        return min(evaluate_expression(child, memberships) for child in args)
+    if operator == "or":
+        return max(evaluate_expression(child, memberships) for child in args)
+    raise ValueError(f"Unknown operator: {operator}")
+```
+
+- Для `atom` возвращается степень принадлежности конкретной переменной к терму — например, `memberships["load"]["high"]`.
+- Для `and` применяется **минимум** результатов дочерних условий. Например, `min(0.4, 0.7143) = 0.4`.
+- Для `or` применяется **максимум**. Например, `max(0.4, 0.7143) = 0.7143`.
+
+Рекурсия позволяет обрабатывать вложенные условия, как в R14: `errors.medium AND (latency.medium OR latency.high)`.
+
+### 4.4. Интерпретация итоговой оценки (`interpret`)
+
+Число после дефаззификации преобразуется в понятную человеку категорию. Это **отдельный этап отображения результата**, не заменяющий нечёткий вывод.
+
+```python
+def interpret(score: float) -> str:
+    if score <= 33:
+        return "Нормальное"
+    if score <= 66:
+        return "Перегруженное"
+    return "Критическое"
+```
+
+Пороговые значения 33 и 66 выбраны для этой учебной модели. Чем выше оценка, тем хуже состояние сети. Например, оценка `50.0` даёт текст «Перегруженное».
+
+### 4.5. Основной алгоритм Мамдани (`infer`)
+
+Функция `infer` связывает все этапы в единый расчёт. Ниже приведён **полный код функции без сокращений**, соответствующий исходному `inference.py`:
+
+```python
+def infer(load: float, latency: float, errors: float) -> InferenceResult:
+    inputs = validate_inputs(load, latency, errors)
+    memberships = {
+        variable: {
+            term: float(fuzz.interp_membership(UNIVERSES[variable], values, inputs[variable]))
+            for term, values in MEMBERSHIPS[variable].items()
+        }
+        for variable in inputs
+    }
+    activations = {rule.code: evaluate_expression(rule.condition, memberships) for rule in RULES}
+    output_x = UNIVERSES["state"]
+    clipped = {
+        rule.code: np.minimum(activations[rule.code], MEMBERSHIPS["state"][rule.output])
+        for rule in RULES
+    }
+    aggregated = np.maximum.reduce(list(clipped.values()))
+    if not np.any(aggregated > 0):
+        raise ValueError("Ни одно правило не активировалось: центроид не определён.")
+    score = float(fuzz.defuzz(output_x, aggregated, "centroid"))
+    return InferenceResult(inputs, memberships, activations, clipped, aggregated, score, interpret(score))
+```
+
+**Разбор вычислений по порядку:**
+
+1. `validate_inputs(...)` проверяет и нормализует входные данные.
+2. `fuzz.interp_membership(...)` выполняет **фаззификацию**: для одного входного числа интерполирует степень принадлежности каждого терма. Итог — вложенный словарь `memberships`.
+3. `evaluate_expression(...)` вычисляет **силу активации** каждого из 17 правил. Результаты сохраняются по кодам `R1`–`R17` в `activations`.
+4. `np.minimum(activations[rule.code], MEMBERSHIPS["state"][rule.output])` выполняет **импликацию Мамдани**: обрезает *всю выходную функцию* соответствующего правила на высоте активации. Для каждого правила получается массив `clipped[rule.code]`.
+5. `np.maximum.reduce(...)` выполняет **агрегацию**: для каждой точки выходной оси берёт максимум среди всех обрезанных функций, получая единую функцию `aggregated`.
+6. `np.any(aggregated > 0)` проверяет, что площадь итоговой фигуры не равна нулю. Без этого центроид не определён.
+7. `fuzz.defuzz(output_x, aggregated, "centroid")` выполняет **дефаззификацию**: вычисляет координату центра тяжести площади под агрегированной функцией, то есть конкретную оценку сети.
+8. `InferenceResult(...)` возвращает входные значения, степени принадлежности, силы правил, обрезанные функции, итоговую функцию, численную оценку и текстовую категорию. Эти данные затем использует Streamlit для графиков и таблиц.
+
+**Пример для значений на скриншоте:** `load=65`, `latency=150`, `errors=2`. Для R4 (*средняя загрузка AND средняя задержка*) сила активации равна `min(0.4, 0.7143) = 0.4`; для R9 (*высокая загрузка AND средняя задержка*) она тоже равна `0.4`; для R14 (*средние ошибки AND (средняя OR большая задержка)*) — `min(0.5, max(0.7143, 0)) = 0.5`. Активированные правила формируют обрезанные функции категории «Перегруженное». После агрегации и центроида получается **50.00 баллов**.
+
+*Примечание о зависимостях:* эти функции находятся в `inference.py` и используют импорты `numpy as np`, `skfuzzy as fuzz`, `math`, а также `MEMBERSHIPS`, `RULES`, `UNIVERSES`, `Expression` и класс результата `InferenceResult`. Приведённые блоки показывают полные тела функций, но запускать их по отдельности без остальных модулей проекта не требуется.
+
+
 Интерфейс реализован в виде веб-приложения Streamlit. Ввод трёх параметров осуществляется через числовые поля. Нажатие кнопки **«Рассчитать состояние сети»** запускает вычисление и выводит оценку, текстовое состояние и рекомендации. Через вкладки можно просмотреть фаззификацию, силы активации всех правил и график «обрезка → агрегация → центроид». Повторный расчёт выполняется без перезапуска приложения.
 
 Входные значения проверяются на принадлежность допустимым диапазонам, числовой тип и конечность значений; предусмотрены сообщения об ошибках для некорректного ввода. Рекомендации формируются по фактическим метрикам и **не влияют** на результат алгоритма Мамдани.
